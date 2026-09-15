@@ -445,7 +445,110 @@ def save_location():
         'user':          u['employee_code'],
         'stop_tracking': False,
     })
+# ─────────────────────────────────────────────────────────────────
+#  ADMIN — LOCATION HISTORY (for History screen)
+# ─────────────────────────────────────────────────────────────────
 
+@app.route('/api/location-history/', methods=['GET'])
+def location_history():
+    u, err = require_auth()
+    if err: return err
+
+    username = request.args.get('username')
+    if not username:
+        return jsonify({'error': 'username param required'}), 400
+
+    # Try to find user by employee_code (admin app sends code)
+    with db_session() as db:
+        user = db.execute(
+            "SELECT * FROM users WHERE employee_code=?",
+            (username,)
+        ).fetchone()
+        if not user:
+            # Fallback: try display name
+            user = db.execute(
+                "SELECT * FROM users WHERE display_name=?",
+                (username,)
+            ).fetchone()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        # Optional limit (default all)
+        limit_param = request.args.get('limit')
+        try:
+            limit = min(int(limit_param), 5000) if limit_param else None
+        except (TypeError, ValueError):
+            limit = None
+
+        query = "SELECT * FROM locations WHERE user_id=? ORDER BY ts ASC"
+        if limit:
+            query += f" LIMIT {limit}"
+
+        rows = db.execute(query, (user['id'],)).fetchall()
+
+    # Sample 5-min intervals (same as Django)
+    points = []
+    last_kept = None
+    for r in rows:
+        try:
+            dt = datetime.fromisoformat(r['ts'].replace('Z', '+00:00'))
+        except Exception:
+            continue
+
+        if last_kept is None or (dt - last_kept).total_seconds() >= 300:
+            points.append({
+                'lat':  r['latitude'],
+                'lng':  r['longitude'],
+                'time': r['ts'],
+            })
+            last_kept = dt
+
+    # Always include the very latest point
+    if rows:
+        last = rows[-1]
+        if not points or points[-1]['time'] != last['ts']:
+            points.append({
+                'lat':  last['latitude'],
+                'lng':  last['longitude'],
+                'time': last['ts'],
+            })
+
+    return jsonify({
+        'username': username,
+        'points':   points,
+    })
+
+
+@app.route('/api/location-history/clear/', methods=['DELETE'])
+def clear_location_history():
+    u, err = require_auth()
+    if err: return err
+
+    username = request.args.get('username')
+    if not username:
+        return jsonify({'error': 'username param required'}), 400
+
+    with db_session() as db:
+        user = db.execute(
+            "SELECT * FROM users WHERE employee_code=?",
+            (username,)
+        ).fetchone()
+        if not user:
+            user = db.execute(
+                "SELECT * FROM users WHERE display_name=?",
+                (username,)
+            ).fetchone()
+        if not user:
+            return jsonify({'error': 'User not found'}), 404
+
+        result = db.execute(
+            "DELETE FROM locations WHERE user_id=?",
+            (user['id'],)
+        )
+        deleted = result.rowcount
+
+    return jsonify({'status': 'cleared', 'deleted': deleted})
+    
 
 # ─────────────────────────────────────────────────────────────────
 #  ADMIN — FLEET
