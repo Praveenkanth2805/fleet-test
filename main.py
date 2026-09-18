@@ -112,6 +112,7 @@ def init_db():
         if cur.fetchone()['c'] == 0:
             seeds = [
                 ('ADMIN001', 'admin123', 'Admin User',      1),
+                ('ADMIN002', 'admin123', 'Admin User 2',      1),
                 ('TEST001',  'test123',  'Test Employee',   0),
                 ('TEST002',  'test123',  'Test Employee 2', 0),
             ]
