@@ -1050,6 +1050,7 @@ def attendance_list():
     if err: return err
 
     target = request.args.get('date') or today_str()
+    is_today = (target == today_str())
 
     with db_session() as conn:
         cur = db_cursor(conn)
@@ -1063,6 +1064,25 @@ def attendance_list():
                 (emp['id'], target)
             )
             rec = cur.fetchone()
+
+            # ── Night-shift fallback ─────────────────────────────
+            # If today's dashboard shows no record for this employee
+            # BUT they are still checked_in from a previous day's
+            # shift (e.g. 9 PM yesterday → still working at 2 AM
+            # today), pull that record so the dashboard correctly
+            # shows "Checked In" instead of "Absent".
+            #
+            # Matches Django's _get_active_attendance_record() logic.
+            # Only applies when viewing TODAY — historical views
+            # always show the exact day's record.
+            if rec is None and is_today:
+                cur.execute(
+                    "SELECT * FROM attendance WHERE user_id=%s "
+                    "AND status='checked_in' "
+                    "ORDER BY date DESC LIMIT 1",
+                    (emp['id'],)
+                )
+                rec = cur.fetchone()
 
             if rec:
                 records.append({
