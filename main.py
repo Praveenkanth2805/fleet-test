@@ -107,24 +107,31 @@ def init_db():
             );
         ''')
 
-        # ── Seed test users ──────────────────────────────────────
-        cur.execute("SELECT COUNT(*) AS c FROM users")
-        if cur.fetchone()['c'] == 0:
-            seeds = [
-                ('ADMIN001', 'admin123', 'Admin User',      1),
-                ('ADMIN002', 'admin123', 'Admin User 2',      1),
-                ('TEST001',  'test123',  'Test Employee',   0),
-                ('TEST002',  'test123',  'Test Employee 2', 0),
-            ]
-            for code, pw, name, is_admin in seeds:
-                cur.execute(
-                    "INSERT INTO users "
-                    "(employee_code, password_hash, display_name, token, is_admin) "
-                    "VALUES (%s, %s, %s, %s, %s)",
-                    (code, generate_password_hash(pw), name,
-                     uuid.uuid4().hex, is_admin)
-                )
-            print('[INIT] Seeded: ADMIN001/admin123, TEST001/test123, TEST002/test123')
+        # ── Seed test users (idempotent — adds only missing ones) ──
+        seeds = [
+            ('ADMIN001', 'admin123', 'Admin User',      1),
+            ('ADMIN002', 'admin123', 'Admin User 2',    1),
+            ('TEST001',  'test123',  'Test Employee',   0),
+            ('TEST002',  'test123',  'Test Employee 2', 0),
+        ]
+        created_codes = []
+        for code, pw, name, is_admin in seeds:
+            cur.execute(
+                "SELECT 1 FROM users WHERE employee_code=%s LIMIT 1",
+                (code,)
+            )
+            if cur.fetchone():
+                continue   # already exists → skip
+            cur.execute(
+                "INSERT INTO users "
+                "(employee_code, password_hash, display_name, token, is_admin) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (code, generate_password_hash(pw), name,
+                 uuid.uuid4().hex, is_admin)
+            )
+            created_codes.append(code)
+        if created_codes:
+            print(f'[INIT] Seeded users: {", ".join(created_codes)}')
 
         # ── Ensure office_settings has the single row ────────────
         cur.execute("SELECT COUNT(*) AS c FROM office_settings WHERE id=1")
