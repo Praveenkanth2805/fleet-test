@@ -82,10 +82,15 @@ def init_db():
                 user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
                 latitude    DOUBLE PRECISION NOT NULL,
                 longitude   DOUBLE PRECISION NOT NULL,
-                ts          TEXT NOT NULL
+                ts          TEXT NOT NULL,
+                accuracy_m  DOUBLE PRECISION
             );
             CREATE INDEX IF NOT EXISTS idx_loc_user_ts
                 ON locations(user_id, ts DESC);
+
+            -- Idempotent migration: add accuracy_m to existing tables
+            ALTER TABLE locations
+                ADD COLUMN IF NOT EXISTS accuracy_m DOUBLE PRECISION;
 
             CREATE TABLE IF NOT EXISTS attendance (
                 id          SERIAL PRIMARY KEY,
@@ -496,10 +501,17 @@ def save_location():
                     if not (-90 <= lat <= 90 and -180 <= lng <= 180):
                         continue
                     ts = normalize_ts(p.get('timestamp'))
+                    # ── accuracy (optional, meters) ──
+                    acc_raw = p.get('accuracy')
+                    try:
+                        acc = float(acc_raw) if acc_raw not in (None, '') else None
+                    except (TypeError, ValueError):
+                        acc = None
                     cur.execute(
-                        "INSERT INTO locations (user_id, latitude, longitude, ts) "
-                        "VALUES (%s, %s, %s, %s)",
-                        (u['id'], lat, lng, ts)
+                        "INSERT INTO locations "
+                        "(user_id, latitude, longitude, ts, accuracy_m) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (u['id'], lat, lng, ts, acc)
                     )
                     saved += 1
                 except (TypeError, ValueError):
@@ -522,12 +534,20 @@ def save_location():
         return jsonify({'error': 'coordinates out of range'}), 400
 
     ts = normalize_ts(data.get('timestamp'))
+    # ── accuracy (optional, meters) ──
+    acc_raw = data.get('accuracy')
+    try:
+        acc = float(acc_raw) if acc_raw not in (None, '') else None
+    except (TypeError, ValueError):
+        acc = None
+
     with db_session() as conn:
         cur = conn.cursor()
         cur.execute(
-            "INSERT INTO locations (user_id, latitude, longitude, ts) "
-            "VALUES (%s, %s, %s, %s)",
-            (u['id'], lat, lng, ts)
+            "INSERT INTO locations "
+            "(user_id, latitude, longitude, ts, accuracy_m) "
+            "VALUES (%s, %s, %s, %s, %s)",
+            (u['id'], lat, lng, ts, acc)
         )
 
     return jsonify({
@@ -707,12 +727,23 @@ def latest_locations():
 
             distance_m   = None
             is_at_office = None
+            acc_m        = None
+            if loc:
+                acc_m = loc.get('accuracy_m') if 'accuracy_m' in loc.keys() else None
+
             if loc and office_lat is not None and office_lng is not None:
                 distance_m = round(haversine_meters(
                     loc['latitude'], loc['longitude'],
                     office_lat, office_lng,
                 ), 1)
-                is_at_office = distance_m <= radius_m
+                # ── accuracy-aware geofence ──
+                # If the GPS fix has a known uncertainty (accuracy_m),
+                # allow the point to count as "at office" when the
+                # measured distance is within radius + accuracy.
+                if acc_m is not None and acc_m > 0:
+                    is_at_office = distance_m <= (radius_m + acc_m)
+                else:
+                    is_at_office = distance_m <= radius_m
 
             result.append({
                 'id':              emp['id'],
@@ -728,6 +759,7 @@ def latest_locations():
                 'distance_m':      distance_m,
                 'is_at_office':    is_at_office,
                 'office_radius_m': radius_m,
+                'accuracy_m':      acc_m,
             })
 
     return jsonify(result)
@@ -792,6 +824,10 @@ def fleet_trails():
                         'lat':  r['latitude'],
                         'lng':  r['longitude'],
                         'time': r['ts'],
+                        'accuracy_m': (
+                            r['accuracy_m']
+                            if 'accuracy_m' in r.keys() else None
+                        ),
                     }
                     for r in rows
                 ],
