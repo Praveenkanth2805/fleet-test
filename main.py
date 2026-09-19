@@ -171,7 +171,10 @@ def normalize_ts(raw):
 
 
 def today_str():
-    return datetime.now(timezone.utc).strftime('%Y-%m-%d')
+    """IST date (matches Django's _today_ist()).
+    Fixes night-shift handling — 9 PM to 5 AM shifts
+    cross midnight, so UTC would store the wrong date."""
+    return datetime.now(IST).strftime('%Y-%m-%d')
 
 
 def haversine_meters(lat1, lng1, lat2, lng2):
