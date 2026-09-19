@@ -110,6 +110,25 @@ def init_db():
                 geofence_enabled  INTEGER DEFAULT 0,
                 updated_at        TIMESTAMPTZ DEFAULT NOW()
             );
+
+            -- ── Per-device tokens for admins ────────────────────
+            -- Each admin login from a different device creates its
+            -- own row. Logout from Device A only deletes Device A's
+            -- row — Device B/C stay logged in.
+            -- Employees continue to use users.token (single token).
+            CREATE TABLE IF NOT EXISTS admin_device_tokens (
+                id          SERIAL PRIMARY KEY,
+                key         TEXT UNIQUE NOT NULL,
+                user_id     INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+                device_id   TEXT NOT NULL DEFAULT '',
+                label       TEXT NOT NULL DEFAULT '',
+                created_at  TIMESTAMPTZ DEFAULT NOW(),
+                last_seen   TIMESTAMPTZ DEFAULT NOW()
+            );
+            CREATE INDEX IF NOT EXISTS idx_adt_user_lastseen
+                ON admin_device_tokens(user_id, last_seen DESC);
+            CREATE INDEX IF NOT EXISTS idx_adt_device
+                ON admin_device_tokens(device_id);
         ''')
 
         # ── Seed test users (idempotent — adds only missing ones) ──
@@ -262,11 +281,42 @@ def current_user():
     token = auth[6:].strip()
     if not token:
         return None
+
     with db_session() as conn:
         cur = db_cursor(conn)
+
+        # ── 1. Try admin_device_tokens first ────────────────────
+        # Use aliased columns so the JOIN never overwrites u['id'].
+        cur.execute(
+            "SELECT u.*, "
+            "       adt.id       AS device_token_id, "
+            "       adt.key      AS device_token_key, "
+            "       adt.device_id AS device_token_device_id "
+            "FROM admin_device_tokens adt "
+            "JOIN users u ON u.id = adt.user_id "
+            "WHERE adt.key = %s",
+            (token,)
+        )
+        row = cur.fetchone()
+        if row:
+            # Touch last_seen (lightweight — no full row update)
+            cur.execute(
+                "UPDATE admin_device_tokens SET last_seen=NOW() "
+                "WHERE id=%s",
+                (row['device_token_id'],)
+            )
+            request.auth_token_type = 'device'
+            request.auth_token_key  = token
+            request.auth_token_id   = row['device_token_id']
+            return row
+
+        # ── 2. Fall back to legacy single-token (employees) ─────
         cur.execute("SELECT * FROM users WHERE token=%s", (token,))
         row = cur.fetchone()
-    return row
+        if row:
+            request.auth_token_type = 'legacy'
+            request.auth_token_key  = token
+        return row
 
 
 def require_auth():
@@ -297,8 +347,48 @@ def login():
         if not user or not check_password_hash(user['password_hash'], pw):
             return jsonify({'error': 'Invalid credentials'}), 401
 
-        token = uuid.uuid4().hex
-        cur.execute("UPDATE users SET token=%s WHERE id=%s", (token, user['id']))
+        # ── Admin → per-device token ────────────────────────────
+        if user['is_admin']:
+            device_id    = str(data.get('device_id', '')).strip()[:128]
+            device_label = str(data.get('device_label', '')).strip()[:64]
+
+            # No device_id → synthetic unique id so each login is
+            # its own session (prevents shared-token collision).
+            if not device_id:
+                device_id = f'anon-{uuid.uuid4().hex[:16]}'
+
+            # Reuse the existing row when the SAME device logs in
+            # again — a device that already has a token doesn't
+            # leak new rows on every login.
+            cur.execute(
+                "SELECT * FROM admin_device_tokens "
+                "WHERE user_id=%s AND device_id=%s FOR UPDATE",
+                (user['id'], device_id)
+            )
+            existing = cur.fetchone()
+
+            if existing:
+                token = existing['key']
+                cur.execute(
+                    "UPDATE admin_device_tokens SET last_seen=NOW() "
+                    "WHERE id=%s",
+                    (existing['id'],)
+                )
+            else:
+                token = uuid.uuid4().hex
+                cur.execute(
+                    "INSERT INTO admin_device_tokens "
+                    "(key, user_id, device_id, label) "
+                    "VALUES (%s, %s, %s, %s)",
+                    (token, user['id'], device_id, device_label)
+                )
+        else:
+            # ── Employee → legacy single token ──────────────────
+            token = uuid.uuid4().hex
+            cur.execute(
+                "UPDATE users SET token=%s WHERE id=%s",
+                (token, user['id'])
+            )
 
     return jsonify({
         'token':         token,
@@ -315,9 +405,26 @@ def login():
 def logout():
     u, err = require_auth()
     if err: return err
+
+    token_type = getattr(request, 'auth_token_type', 'legacy')
+    token_key  = getattr(request, 'auth_token_key', None)
+
     with db_session() as conn:
         cur = conn.cursor()
-        cur.execute("UPDATE users SET token=NULL WHERE id=%s", (u['id'],))
+        if token_type == 'device' and token_key:
+            # Admin device token → delete only this device's row.
+            # Other devices of the same admin stay logged in.
+            cur.execute(
+                "DELETE FROM admin_device_tokens WHERE key=%s",
+                (token_key,)
+            )
+        else:
+            # Employee / legacy admin → clear single token.
+            cur.execute(
+                "UPDATE users SET token=NULL WHERE id=%s",
+                (u['id'],)
+            )
+
     return jsonify({'status': 'logged out'})
 
 
