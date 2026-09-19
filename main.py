@@ -194,6 +194,64 @@ def haversine_meters(lat1, lng1, lat2, lng2):
 
 
 # ─────────────────────────────────────────────────────────────────
+#  PRECISE-LOCATION HARD CAP
+# ─────────────────────────────────────────────────────────────────
+#
+#  Android 12+ lets users pick "Approximate" location — GPS is capped
+#  at ~2 km accuracy. Combined with any accuracy-aware geofence, a
+#  test client could pass while physically far from the office. The
+#  full Django backend enforces a 500 m cap; the fleet test backend
+#  mirrors it so testing matches production behavior.
+#
+#  Returns None on success, or a (response, status) tuple on failure.
+# ─────────────────────────────────────────────────────────────────
+
+def _require_precise_location():
+    """Return an error response tuple if the request's location is
+    missing or imprecise. Otherwise return None."""
+    data = request.get_json(silent=True) or {}
+
+    lat = data.get('latitude')
+    lng = data.get('longitude')
+    acc = data.get('accuracy')
+
+    # (0,0) check — fake-GPS default
+    try:
+        lat_f = float(lat)
+        lng_f = float(lng)
+    except (TypeError, ValueError):
+        return jsonify({
+            'error': 'location_required',
+            'message': 'Location is required to mark attendance.',
+        }), 400
+
+    if abs(lat_f) < 0.0001 and abs(lng_f) < 0.0001:
+        return jsonify({
+            'error': 'invalid_gps',
+            'message': 'Invalid GPS position detected.',
+        }), 400
+
+    # Precision cap
+    try:
+        acc_m = float(acc) if acc not in (None, '') else None
+    except (TypeError, ValueError):
+        acc_m = None
+
+    if acc_m is not None and acc_m > 500:
+        return jsonify({
+            'error': 'location_imprecise',
+            'message': (
+                'Precise location is required for attendance. '
+                'Open Settings → Apps → this app → Permissions → '
+                'Location, and select "Precise".'
+            ),
+            'accuracy_m': acc_m,
+        }), 400
+
+    return None
+
+
+# ─────────────────────────────────────────────────────────────────
 #  AUTH
 # ─────────────────────────────────────────────────────────────────
 
@@ -338,6 +396,10 @@ def checkin():
     u, err = require_auth()
     if err: return err
 
+    # ── Precise-location hard cap (mirrors Django backend) ──
+    err = _require_precise_location()
+    if err: return err
+
     today = today_str()
     with db_session() as conn:
         cur = db_cursor(conn)
@@ -372,6 +434,10 @@ def checkin():
 @app.route('/api/checkout/', methods=['POST'])
 def checkout():
     u, err = require_auth()
+    if err: return err
+
+    # ── Precise-location hard cap (mirrors Django backend) ──
+    err = _require_precise_location()
     if err: return err
 
     today = today_str()
